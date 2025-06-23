@@ -311,19 +311,21 @@ Pilih opsi di bawah untuk memulai:
             self.logger.error(f"Error in sync wrapper for server {server_name}: {e}")
             return []
     async def scan_server_files(self, server_id: str, server_name: str) -> List[Dict]:
-        """Scan files in a server with error handling"""
+        """Scan files in a server with improved error handling"""
         found_files = []
         
         try:
-            self.logger.info(f"Scanning server: {server_name} ({server_id})")
+            self.logger.info(f"🔍 Scanning: {server_name}")
             
-            # Scan root directory
+            # Quick health check - try to get root files
             files = await self.get_server_files_async(server_id, "/")
             
             if not files:
-                self.logger.warning(f"Server {server_name} returned no files or is inaccessible")
+                self.logger.info(f"⚪ {server_name}: No files or server inaccessible - skipping")
                 return found_files
             
+            # Scan for target files
+            target_found_in_root = False
             for file_item in files:
                 if (file_item['attributes']['is_file'] and 
                     file_item['attributes']['name'] == self.target_filename):
@@ -337,23 +339,30 @@ Pilih opsi di bawah untuk memulai:
                         'modified_at': file_item['attributes']['modified_at']
                     })
                     
-                    self.logger.info(f"Found target file in {server_name}: {file_item['attributes']['name']}")
+                    target_found_in_root = True
+                    self.logger.info(f"✅ {server_name}: Found {self.target_filename} in root directory")
             
-            # Scan subdirectories if enabled
-            if self.scan_subdirs and files:
+            # Only scan subdirectories if enabled and no target found in root
+            if self.scan_subdirs and not target_found_in_root and files:
                 try:
+                    self.logger.debug(f"🔍 {server_name}: Scanning subdirectories...")
                     subdirs_found = await self.scan_subdirectories(server_id, server_name, files, depth=1)
                     found_files.extend(subdirs_found)
+                    
+                    if subdirs_found:
+                        self.logger.info(f"✅ {server_name}: Found {len(subdirs_found)} files in subdirectories")
+                        
                 except Exception as e:
-                    self.logger.warning(f"Error scanning subdirectories in {server_name}: {e}")
+                    self.logger.debug(f"⚠️ {server_name}: Error scanning subdirectories: {str(e)[:50]}...")
+            
+            # Final result
+            if found_files:
+                self.logger.info(f"🎯 {server_name}: Total {len(found_files)} target files found")
+            else:
+                self.logger.debug(f"📭 {server_name}: No {self.target_filename} files found")
         
         except Exception as e:
-            self.logger.error(f"Error scanning server {server_name}: {e}")
-        
-        if found_files:
-            self.logger.info(f"Server {server_name} scan complete: {len(found_files)} files found")
-        else:
-            self.logger.debug(f"Server {server_name} scan complete: no target files found")
+            self.logger.error(f"❌ {server_name}: Scan failed - {str(e)[:50]}...")
             
         return found_files
 
@@ -398,9 +407,9 @@ Pilih opsi di bawah untuk memulai:
         
         return found_files
     async def get_server_files_async(self, server_id: str, path: str = "/") -> List[Dict]:
-        """Get files from server asynchronously with retry mechanism"""
-        max_retries = Config.RETRY_ATTEMPTS
-        retry_delay = Config.RETRY_DELAY
+        """Get files from server asynchronously with improved error handling"""
+        max_retries = 2  # Reduce retries for faster scanning
+        retry_delay = 3  # Reduce delay
         
         for attempt in range(max_retries):
             try:
@@ -411,57 +420,58 @@ Pilih opsi di bawah untuk memulai:
                 if path != "/":
                     params['directory'] = path
                 
-                self.logger.debug(f"Attempting to get files from server {server_id}, path: {path}, attempt: {attempt + 1}")
+                self.logger.debug(f"Server {server_id}: Getting files from '{path}' (attempt {attempt + 1})")
                 
                 response = requests.get(
                     url, 
                     headers=self.client_headers, 
                     params=params,
-                    timeout=self.scan_timeout
+                    timeout=15  # Reduce timeout
                 )
-                
-                self.logger.debug(f"Server {server_id} file list response: {response.status_code}")
                 
                 if response.status_code == 200:
                     data = response.json()
+                    self.logger.debug(f"Server {server_id}: Success, found {len(data['data'])} items")
                     return data['data']
+                    
                 elif response.status_code == 500:
-                    self.logger.warning(f"Server {server_id} returned 500 (attempt {attempt + 1}/{max_retries}) - server may be offline")
-                    if attempt < max_retries - 1:
-                        self.logger.info(f"Retrying in {retry_delay} seconds...")
+                    self.logger.warning(f"Server {server_id}: Server error 500 (attempt {attempt + 1}/{max_retries})")
+                    if attempt == 0:  # Only retry once for 500 errors
                         await asyncio.sleep(retry_delay)
                         continue
                     else:
-                        self.logger.error(f"Server {server_id} consistently returning 500 - skipping server")
+                        self.logger.info(f"Server {server_id}: Skipping - server appears offline or misconfigured")
                         return []
+                        
                 elif response.status_code == 404:
-                    self.logger.warning(f"Server {server_id} path '{path}' not found (404)")
+                    self.logger.debug(f"Server {server_id}: Path '{path}' not found - empty directory")
                     return []
+                    
                 elif response.status_code == 403:
-                    self.logger.error(f"Server {server_id} access forbidden (403) - check API permissions")
+                    self.logger.warning(f"Server {server_id}: Access forbidden - insufficient permissions")
                     return []
+                    
+                elif response.status_code == 502 or response.status_code == 503:
+                    self.logger.info(f"Server {server_id}: Service unavailable ({response.status_code}) - skipping")
+                    return []
+                    
                 else:
-                    self.logger.error(f"Server {server_id} unexpected status: {response.status_code}")
+                    self.logger.warning(f"Server {server_id}: HTTP {response.status_code} - skipping")
                     return []
                     
             except requests.exceptions.Timeout:
-                self.logger.warning(f"Server {server_id} timeout (attempt {attempt + 1}/{max_retries})")
+                self.logger.info(f"Server {server_id}: Timeout - server may be slow or unresponsive")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
+                    await asyncio.sleep(2)
                     continue
-                else:
-                    self.logger.error(f"Server {server_id} timed out after {max_retries} attempts")
-                    return []
-            except requests.exceptions.ConnectionError as e:
-                self.logger.warning(f"Server {server_id} connection error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    continue
-                else:
-                    self.logger.error(f"Server {server_id} connection failed after {max_retries} attempts")
-                    return []
+                return []
+                
+            except requests.exceptions.ConnectionError:
+                self.logger.info(f"Server {server_id}: Connection failed - server may be offline")
+                return []
+                
             except Exception as e:
-                self.logger.error(f"Server {server_id} unexpected error: {e}")
+                self.logger.error(f"Server {server_id}: Unexpected error - {str(e)[:100]}")
                 return []
         
         return []
@@ -488,18 +498,21 @@ Pilih opsi di bawah untuk memulai:
             
             # Sequential scanning untuk menghindari masalah concurrency
             all_found_files = []
+            successful_scans = 0
+            failed_scans = 0
             
             for i, server in enumerate(servers, 1):
                 server_id = server['attributes']['identifier']
                 server_name = server['attributes']['name']
                 
                 try:
-                    # Update progress
+                    # Update progress with server status
                     progress = (i / len(servers)) * 100
-                    progress_msg = f"🔍 Scanning server {i}/{len(servers)}: {server_name}\n"
+                    progress_msg = f"🔍 Scanning {i}/{len(servers)} servers\n"
                     progress_msg += f"📊 Progress: {progress:.1f}%\n"
-                    progress_msg += f"📄 Found files: {len(all_found_files)}\n"
-                    progress_msg += f"⏰ Current: {server_name[:20]}..."
+                    progress_msg += f"📄 Files found: {len(all_found_files)}\n"
+                    progress_msg += f"✅ Success: {successful_scans} | ❌ Failed: {failed_scans}\n"
+                    progress_msg += f"🖥️ Current: {server_name[:25]}..."
                     
                     await update_obj.edit_message_text(progress_msg)
                     
@@ -507,14 +520,17 @@ Pilih opsi di bawah untuk memulai:
                     found_files = await self.scan_server_files(server_id, server_name)
                     all_found_files.extend(found_files)
                     
-                    # Log result for this server
-                    if found_files:
-                        self.logger.info(f"✅ {server_name}: {len(found_files)} files found")
-                    else:
-                        self.logger.debug(f"⚪ {server_name}: no target files")
+                    # Update counters
+                    if found_files or not found_files:  # Always count as successful if no exception
+                        successful_scans += 1
+                        if found_files:
+                            self.logger.info(f"✅ {server_name}: {len(found_files)} files")
+                        else:
+                            self.logger.debug(f"⚪ {server_name}: no target files")
                     
                 except Exception as e:
-                    self.logger.error(f"❌ {server_name}: {e}")
+                    failed_scans += 1
+                    self.logger.error(f"❌ {server_name}: {str(e)[:50]}...")
                     # Continue with next server instead of stopping
             
             # Save scan results
@@ -530,16 +546,21 @@ Pilih opsi di bawah untuk memulai:
             
             # Generate results message
             if all_found_files:
-                result_msg = f"✅ **Scan Completed!**\n\n"
-                result_msg += f"🎯 Found {len(all_found_files)} files:\n\n"
+                result_msg = f"✅ **Scan Completed Successfully!**\n\n"
+                result_msg += f"📊 **Statistics:**\n"
+                result_msg += f"• Servers scanned: {len(servers)}\n"
+                result_msg += f"• Successful: {successful_scans}\n"
+                result_msg += f"• Failed/Offline: {failed_scans}\n"
+                result_msg += f"• Target files found: {len(all_found_files)}\n\n"
+                result_msg += f"📁 **Found Files:**\n"
                 
-                for i, file_info in enumerate(all_found_files[:10], 1):  # Show first 10
+                for i, file_info in enumerate(all_found_files[:8], 1):  # Show first 8
                     result_msg += f"{i}. **{file_info['server_name']}**\n"
-                    result_msg += f"   📁 Path: `{file_info['file_path']}`\n"
-                    result_msg += f"   📊 Size: {file_info['size']} bytes\n\n"
+                    result_msg += f"   📁 `{file_info['file_path']}`\n"
+                    result_msg += f"   📊 {file_info['size']:,} bytes\n\n"
                 
-                if len(all_found_files) > 10:
-                    result_msg += f"... and {len(all_found_files) - 10} more files\n\n"
+                if len(all_found_files) > 8:
+                    result_msg += f"... and {len(all_found_files) - 8} more files\n\n"
                 
                 # Add backup button
                 keyboard = [[InlineKeyboardButton("🚀 Start Backup", callback_data="start_backup")]]
@@ -548,7 +569,17 @@ Pilih opsi di bawah untuk memulai:
                 context.user_data['current_scan_id'] = scan_id
                 
             else:
-                result_msg = f"❌ No `{self.target_filename}` files found in any server."
+                result_msg = f"📋 **Scan Completed**\n\n"
+                result_msg += f"📊 **Statistics:**\n"
+                result_msg += f"• Servers scanned: {len(servers)}\n"
+                result_msg += f"• Successful: {successful_scans}\n"
+                result_msg += f"• Failed/Offline: {failed_scans}\n\n"
+                result_msg += f"❌ No `{self.target_filename}` files found.\n\n"
+                result_msg += f"💡 **Possible reasons:**\n"
+                result_msg += f"• Files don't exist on servers\n"
+                result_msg += f"• Servers are offline/inaccessible\n"
+                result_msg += f"• Different filename (check config)\n"
+                result_msg += f"• Permission issues"
                 reply_markup = None
             
             await update_obj.edit_message_text(
